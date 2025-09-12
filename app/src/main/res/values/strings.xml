@@ -1,3 +1,7 @@
 <resources>
     <string name="app_name">AiFreind</string>
+    <string name="accessibility_service_description">
+        AI Friend watches Instagram Reels captions and helps you if the content feels negative.
+    </string>
+
 </resources>

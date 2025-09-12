@@ -1,0 +1,9 @@
+<accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
+    android:accessibilityEventTypes="typeWindowContentChanged|typeViewTextChanged"
+    android:accessibilityFlags="flagReportViewIds|flagRetrieveInteractiveWindows"
+    android:canRetrieveWindowContent="true"
+    android:notificationTimeout="100"
+    android:description="@string/accessibility_service_description"
+    android:settingsActivity="com.example.aifreind.SettingsActivity"
+    android:accessibilityFeedbackType="feedbackSpoken"
+    android:packageNames="com.instagram.android" />
