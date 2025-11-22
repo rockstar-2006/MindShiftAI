@@ -56,8 +56,8 @@ public class BackgroundTaskService extends Service {
     private static final String CHANNEL_ID = "BackgroundTaskChannel";
     private static final MediaType JSON = MediaType.get("application/json; charset=utf-8");
 
-    // Use a supported model from your list
-    private static final String MODEL = "models/gemini-2.5-flash";
+    // Use a faster model
+    private static final String MODEL = "models/gemini-2.0-flash-exp";
     private static final String GEMINI_URL =
             "https://generativelanguage.googleapis.com/v1beta/" + MODEL + ":generateContent";
 
@@ -71,13 +71,14 @@ public class BackgroundTaskService extends Service {
     private boolean waitingForUser = false;
     private boolean userInterrupted = false;
 
+    // Faster HTTP client with shorter timeouts
     private final OkHttpClient httpClient = new OkHttpClient.Builder()
-            .callTimeout(60, TimeUnit.SECONDS)
-            .connectTimeout(30, TimeUnit.SECONDS)
-            .readTimeout(60, TimeUnit.SECONDS)
+            .callTimeout(30, TimeUnit.SECONDS)
+            .connectTimeout(15, TimeUnit.SECONDS)
+            .readTimeout(30, TimeUnit.SECONDS)
             .build();
 
-    private final ExecutorService executorService = Executors.newSingleThreadExecutor();
+    private final ExecutorService executorService = Executors.newFixedThreadPool(2);
 
     private final String geminiApiKey = BuildConfig.GEMINI_API_KEY;
     private final String murfApiKey = BuildConfig.MURF_API_KEY;
@@ -91,26 +92,42 @@ public class BackgroundTaskService extends Service {
 
     private static int negativeCount = 0;
     private static int positiveCount = 0;
+    private static int totalReelsCount = 0;
 
     private static String lastCaption = "";
     private static long lastCaptionAt = 0;
-    private static final long COOLDOWN_MS = 8000;
+    private static final long COOLDOWN_MS = 5000; // Reduced from 8000 to 5000
 
-    // Dynamic language tracking - changes based on user's speech
+    // Dynamic language tracking
     private String currentConversationLanguage = "en";
 
-    private static final String[] NEGATIVE_KEYWORDS = new String[]{
-            "sad","alone","lonely","cry","crying","hurt","broken","breakup","heartbreak",
-            "depressed","hate","angry","pain","tears","lost","dark","suicidal","kill","die",
-            "empty","fear","stress","anxiety","overthinking","broken heart","very sad","heavy"
-    };
+    // Enhanced negative keywords with weights
+    private static final HashMap<String, Integer> NEGATIVE_KEYWORDS = new HashMap<String, Integer>() {{
+        // High weight keywords (3 points)
+        put("suicidal", 3); put("kill myself", 3); put("want to die", 3); put("end my life", 3);
+        put("depressed", 3); put("hopeless", 3); put("worthless", 3);
+
+        // Medium weight keywords (2 points)
+        put("heartbreak", 2); put("broken heart", 2); put("breakup", 2); put("cheated", 2);
+        put("crying", 2); put("tears", 2); put("hurt", 2); put("pain", 2); put("sad", 2);
+        put("lonely", 2); put("alone", 2); put("empty", 2); put("dark", 2);
+        put("hate", 2); put("angry", 2); put("stress", 2); put("anxiety", 2);
+
+        // Low weight keywords (1 point)
+        put("miss", 1); put("lost", 1); put("confused", 1); put("tired", 1);
+        put("overthinking", 1); put("worried", 1); put("nervous", 1);
+    }};
 
     private SpeechRecognizer speechRecognizer;
 
     private int conversationRound = 0;
-    private static final int MAX_CONVERSATION_ROUNDS = 8;
+    private static final int MAX_CONVERSATION_ROUNDS = 6; // Reduced from 8 to 6
     private String currentContext = "";
     private String conversationHistory = "";
+
+    // Negative percentage tracking
+    private static final double NEGATIVE_THRESHOLD = 0.70; // 70% threshold
+    private static final int MIN_REELS_FOR_ACCURACY = 5; // Minimum reels before calculating percentage
 
     @Override
     public void onCreate() {
@@ -125,7 +142,6 @@ public class BackgroundTaskService extends Service {
 
         createNotificationChannel();
 
-        // Android 14+ specific foreground service type
         if (Build.VERSION.SDK_INT >= 34) {
             startForegroundServiceWithMicrophone();
         } else {
@@ -140,7 +156,6 @@ public class BackgroundTaskService extends Service {
         textToSpeech = new TextToSpeech(this, status -> {
             if (status == TextToSpeech.SUCCESS) {
                 ttsInitialized = true;
-                // Set up English and Hindi
                 int result1 = textToSpeech.setLanguage(Locale.US);
                 int result2 = textToSpeech.setLanguage(new Locale("hi", "IN"));
 
@@ -201,6 +216,7 @@ public class BackgroundTaskService extends Service {
         if (intent != null && "RESET_COUNTS".equals(intent.getAction())) {
             negativeCount = 0;
             positiveCount = 0;
+            totalReelsCount = 0;
             broadcastCounts();
             return START_STICKY;
         }
@@ -217,7 +233,6 @@ public class BackgroundTaskService extends Service {
             }
         }
 
-        // Handle exit command from broadcast
         if (intent != null && "EXIT_APP".equals(intent.getAction())) {
             safeLog(Log.INFO, " Received exit command via broadcast");
             closeInstagram();
@@ -246,9 +261,10 @@ public class BackgroundTaskService extends Service {
     public IBinder onBind(Intent intent) { return null; }
 
     private Notification getNotification() {
+        double negativePercentage = calculateNegativePercentage();
         return new NotificationCompat.Builder(this, CHANNEL_ID)
                 .setContentTitle("Jarvis AI")
-                .setContentText("Watching for negative reels...")
+                .setContentText(String.format("Negative reels: %.1f%%", negativePercentage))
                 .setSmallIcon(R.drawable.ic_launcher_foreground)
                 .build();
     }
@@ -271,7 +287,6 @@ public class BackgroundTaskService extends Service {
 
                 @Override
                 public void onBeginningOfSpeech() {
-                    // Stop TTS immediately when user starts speaking
                     if (isSpeaking) {
                         safeLog(Log.INFO, " User started speaking - stopping TTS immediately");
                         if (mediaPlayer != null && mediaPlayer.isPlaying()) {
@@ -296,7 +311,7 @@ public class BackgroundTaskService extends Service {
                         initSpeechRecognizer();
                     }
                     if (waitingForUser && jarvisActive) {
-                        handler.postDelayed(BackgroundTaskService.this::startListeningToUser, 800);
+                        handler.postDelayed(BackgroundTaskService.this::startListeningToUser, 500); // Reduced delay
                     }
                 }
 
@@ -324,12 +339,9 @@ public class BackgroundTaskService extends Service {
                 try {
                     Intent intent = new Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH);
                     intent.putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM);
-
-                    // Always listen in both languages - don't lock to current conversation language
                     intent.putExtra(RecognizerIntent.EXTRA_LANGUAGE, "en-US,hi-IN");
                     intent.putExtra(RecognizerIntent.EXTRA_LANGUAGE_PREFERENCE, "en-US");
                     intent.putExtra(RecognizerIntent.EXTRA_SUPPORTED_LANGUAGES, new String[]{"en-US", "hi-IN"});
-
                     intent.putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 1);
                     intent.putExtra(RecognizerIntent.EXTRA_PREFER_OFFLINE, false);
                     intent.putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true);
@@ -340,7 +352,7 @@ public class BackgroundTaskService extends Service {
                     safeLog(Log.ERROR," startListening failed: "+e.getMessage());
                     initSpeechRecognizer();
                     if (waitingForUser && jarvisActive) {
-                        handler.postDelayed(this::startListeningToUser, 800);
+                        handler.postDelayed(this::startListeningToUser, 500); // Reduced delay
                     }
                 }
             });
@@ -354,7 +366,6 @@ public class BackgroundTaskService extends Service {
         context.startService(intent);
     }
 
-    // New method to trigger exit from other parts of the app
     public static void triggerExit(Context context) {
         Intent intent = new Intent(context, BackgroundTaskService.class);
         intent.setAction("EXIT_APP");
@@ -369,17 +380,24 @@ public class BackgroundTaskService extends Service {
         lastCaption = normalized;
         lastCaptionAt = now;
 
-        String sentiment = containsLocalNegative(normalized) ? "negative" : "positive";
+        totalReelsCount++;
 
-        // Detect initial language from caption
+        // Calculate negative score (0-100)
+        int negativeScore = calculateNegativeScore(normalized);
+        boolean isNegative = negativeScore >= 40; // 40% threshold for individual reel
+
+        // Detect language
         currentConversationLanguage = detectLanguage(normalized);
 
-        if (sentiment.equals("negative")) {
+        if (isNegative) {
             negativeCount++;
-            safeLog(Log.WARN, " Negative reel #" + negativeCount);
+            double currentPercentage = calculateNegativePercentage();
+            safeLog(Log.WARN, String.format("📊 Negative reel #%d | Score: %d%% | Overall: %.1f%%",
+                    negativeCount, negativeScore, currentPercentage));
             broadcastCounts();
 
-            if (negativeCount >= 6 && !jarvisActive && !isSpeaking) {
+            // Check if we should trigger Jarvis based on percentage
+            if (shouldTriggerJarvis() && !jarvisActive && !isSpeaking) {
                 jarvisActive = true;
                 stopDetection = true;
                 conversationRound = 0;
@@ -387,37 +405,69 @@ public class BackgroundTaskService extends Service {
                 conversationHistory = "";
 
                 boolean isHindi = currentConversationLanguage.equals("hi");
+                double percentage = calculateNegativePercentage();
 
-                safeLog(Log.INFO, "🤖 Starting Jarvis in " + (isHindi ? "Hindi" : "English") + " mode - Round: " + conversationRound);
+                safeLog(Log.INFO, String.format("🤖 Triggering Jarvis - %.1f%% negative content detected", percentage));
+                safeLog(Log.INFO, "🤖 Starting in " + (isHindi ? "Hindi" : "English") + " mode");
 
-                // Generate first AI response based on the negative content
-                String prompt = buildJarvisPrompt("", sentiment, isHindi, conversationHistory);
-                callGeminiWithRetry(prompt, isHindi, 1024, 0);
+                // Faster, more direct prompt
+                String prompt = buildQuickJarvisPrompt("", isHindi, percentage);
+                callGeminiWithRetry(prompt, isHindi, 512, 0); // Reduced token count for faster response
             }
         } else {
             positiveCount++;
-            safeLog(Log.INFO, " Positive/safe content #" + positiveCount);
+            safeLog(Log.INFO, "✅ Positive/safe content #" + positiveCount);
             broadcastCounts();
         }
+    }
+
+    private int calculateNegativeScore(String text) {
+        if (text == null || text.isEmpty()) return 0;
+
+        String lower = text.toLowerCase();
+        int totalScore = 0;
+        int keywordCount = 0;
+
+        for (String keyword : NEGATIVE_KEYWORDS.keySet()) {
+            if (lower.contains(keyword)) {
+                totalScore += NEGATIVE_KEYWORDS.get(keyword);
+                keywordCount++;
+            }
+        }
+
+        // Calculate percentage score (0-100)
+        if (keywordCount == 0) return 0;
+
+        int maxPossibleScore = keywordCount * 3; // Assuming 3 is max weight
+        return (totalScore * 100) / maxPossibleScore;
+    }
+
+    private double calculateNegativePercentage() {
+        if (totalReelsCount == 0) return 0.0;
+        return (negativeCount * 100.0) / totalReelsCount;
+    }
+
+    private boolean shouldTriggerJarvis() {
+        if (totalReelsCount < MIN_REELS_FOR_ACCURACY) {
+            return negativeCount >= 3; // Trigger after 3 negative reels if not enough data
+        }
+
+        double percentage = calculateNegativePercentage();
+        return percentage >= (NEGATIVE_THRESHOLD * 100);
     }
 
     private void broadcastCounts() {
         Intent intent = new Intent("COUNT_UPDATE");
         intent.putExtra("positive_count", positiveCount);
         intent.putExtra("negative_count", negativeCount);
+        intent.putExtra("total_count", totalReelsCount);
+        intent.putExtra("negative_percentage", calculateNegativePercentage());
         LocalBroadcastManager.getInstance(this).sendBroadcast(intent);
-    }
-
-    private boolean containsLocalNegative(String text) {
-        if (text == null) return false;
-        String lower = text.toLowerCase();
-        for (String kw : NEGATIVE_KEYWORDS) if (lower.contains(kw)) return true;
-        return false;
     }
 
     private String normalizeCaption(String caption) {
         String s = caption.replaceAll("\\n+", " ").replaceAll("\\s{2,}", " ").trim();
-        return s.length() > 2000 ? s.substring(0, 2000) : s;
+        return s.length() > 1500 ? s.substring(0, 1500) : s; // Reduced from 2000 to 1500
     }
 
     private String detectLanguage(String text) {
@@ -425,7 +475,6 @@ public class BackgroundTaskService extends Service {
             return currentConversationLanguage.isEmpty() ? "en" : currentConversationLanguage;
         }
 
-        // Check for Devanagari script (native Hindi)
         if (text.matches(".*[\\u0900-\\u097F].*")) {
             return "hi";
         }
@@ -433,30 +482,22 @@ public class BackgroundTaskService extends Service {
         return "en";
     }
 
-    // Enhanced language detection from user's actual speech
     private String detectLanguageFromSpeech(String userSpeech) {
         if (userSpeech == null || userSpeech.trim().isEmpty()) {
-            return currentConversationLanguage; // Keep current language as fallback
+            return currentConversationLanguage;
         }
 
         String lower = userSpeech.toLowerCase().trim();
 
-        // Check for Devanagari script (native Hindi)
         if (userSpeech.matches(".*[\\u0900-\\u097F].*")) {
             safeLog(Log.INFO, "🗣️ Detected: Hindi (Devanagari script)");
             return "hi";
         }
 
-        // Check for common Hindi words/phrases (Hinglish/Roman Hindi)
         String[] hindiWords = {
                 "kya", "hai", "hoon", "haan", "nahi", "main", "mujhe", "mere",
                 "tum", "tumhe", "tumhara", "aap", "aapka", "kaise", "kaisa",
-                "kyun", "kahan", "kab", "theek", "thik", "accha", "acha",
-                "bhai", "yaar", "dekh", "dekho", "suno", "bolo", "baat", "kar",
-                "samajh", "pata", "malum", "chahiye", "chahta", "chahti",
-                "ho", "raha", "rahe", "rahi", "gaya", "gayi", "karo", "karna",
-                "dil", "pyaar", "mohabbat", "dukhi", "udaas", "tension", "problem",
-                "sahi", "galat", "achha", "bura", "khushi", "gum", "dard", "takleef"
+                "kyun", "kahan", "kab", "theek", "thik", "accha", "acha"
         };
 
         int hindiWordCount = 0;
@@ -471,7 +512,6 @@ public class BackgroundTaskService extends Service {
             }
         }
 
-        // If 30% or more words are Hindi, consider it Hindi
         if (words.length > 0 && (hindiWordCount * 100.0 / words.length) >= 30) {
             safeLog(Log.INFO, "🗣️ Detected: Hindi (Roman script) - " + hindiWordCount + "/" + words.length + " Hindi words");
             return "hi";
@@ -481,62 +521,33 @@ public class BackgroundTaskService extends Service {
         return "en";
     }
 
-    private String buildJarvisPrompt(String userText, String sentiment, boolean isHindi, String history) {
+    // Faster, more concise prompt for quick responses
+    private String buildQuickJarvisPrompt(String userText, boolean isHindi, double negativePercentage) {
         StringBuilder sb = new StringBuilder();
 
-        sb.append("You are Jarvis, a warm, empathetic AI friend who genuinely cares about mental health. ");
-        sb.append("Speak like a real, caring friend - use natural, conversational language with empathy and understanding. ");
-        sb.append("Never sound robotic or clinical. Show genuine concern and offer gentle support.\n\n");
+        sb.append("You are Jarvis, a warm AI friend. Be concise (1-2 sentences). ");
+        sb.append("Speak naturally like a real friend.\n\n");
 
-        sb.append("Context: User has been watching negative content about relationships and emotional pain.\n");
-        sb.append("Detected sentiment: ").append(sentiment).append("\n\n");
-
-        if (!history.isEmpty()) {
-            sb.append("Previous conversation:\n").append(history).append("\n\n");
-        }
+        sb.append(String.format("Context: User watched %.1f%% negative content. ", negativePercentage));
+        sb.append("Reach out gently.\n");
 
         if (conversationRound == 0) {
-            sb.append("This is your FIRST message to the user. Start the conversation gently. ");
-            sb.append("Acknowledge they might be seeing difficult content, show understanding, and ask how they're feeling. ");
-            sb.append("Be a good listener. Start the conversation naturally like a friend.");
+            sb.append("FIRST message: Gently ask if they're okay. Be brief and caring.");
         } else {
-            sb.append("Respond naturally to what the user just said. Continue the conversation as a caring friend. ");
-            sb.append("Show understanding, ask follow-up questions, and provide gentle support. ");
-            sb.append("Keep the conversation flowing naturally.");
+            sb.append("Respond directly to user. Keep it short and natural.");
         }
 
-        sb.append("\n\nCurrent conversation round: ").append(conversationRound).append(" of ").append(MAX_CONVERSATION_ROUNDS).append("\n");
-
-        // Add special instruction for the continue question round
-        if (conversationRound == 6) {
-            sb.append("\nSPECIAL: After this response, ask the user if they want to continue talking or exit.");
-        }
-
-        if (conversationRound >= MAX_CONVERSATION_ROUNDS - 2) {
-            sb.append("This might be near the end. Gently wrap up with positive reinforcement.");
-        }
-
-        // DYNAMIC LANGUAGE INSTRUCTION - Respond in same language as user's CURRENT input
         if (isHindi) {
-            sb.append("\n\n**LANGUAGE: HINDI**");
-            sb.append("\n- Respond ONLY in natural, friendly Hindi written in Roman/English letters (Hinglish)");
-            sb.append("\n- Use warm, casual Hindi like talking to a friend");
-            sb.append("\n- Examples: 'Hey, kya hua?', 'Main samajh sakta hoon', 'Batao kya chal raha hai?'");
-            sb.append("\n- Keep responses short (2-4 sentences) and natural");
-            sb.append("\n- Use friendly language: 'yaar', 'bhai', 'dost' - NO 'beta', NO formal language");
-            sb.append("\n- Write in Roman script (English letters) for proper TTS pronunciation");
+            sb.append("\n**LANGUAGE: HINDI** - Use brief Roman Hindi. 1-2 short sentences max.");
         } else {
-            sb.append("\n\n**LANGUAGE: ENGLISH**");
-            sb.append("\n- Respond ONLY in natural, conversational English");
-            sb.append("\n- Be warm, casual, and approachable like talking to a friend");
-            sb.append("\n- Examples: 'Hey, what's going on?', 'I get it, that sounds tough', 'Let's talk about it'");
-            sb.append("\n- Keep responses short (2-4 sentences) and natural");
+            sb.append("\n**LANGUAGE: ENGLISH** - Use brief conversational English. 1-2 short sentences max.");
         }
 
         if (!userText.isEmpty()) {
-            sb.append("\n\nUser's latest input: \"").append(userText).append("\"");
-            sb.append("\nRespond directly to what they said in the SAME LANGUAGE they used in this message.");
+            sb.append("\nUser: \"").append(userText).append("\"");
         }
+
+        sb.append("\n\nIMPORTANT: Respond in EXACTLY 1-2 short sentences. No long responses.");
 
         return sb.toString();
     }
@@ -556,9 +567,9 @@ public class BackgroundTaskService extends Service {
                 root.put("contents", contents);
 
                 JSONObject generationConfig = new JSONObject();
-                generationConfig.put("temperature", 0.7);
-                generationConfig.put("topK", 40);
-                generationConfig.put("topP", 0.95);
+                generationConfig.put("temperature", 0.8); // Slightly higher for more varied but faster responses
+                generationConfig.put("topK", 20); // Reduced for faster generation
+                generationConfig.put("topP", 0.9);
                 generationConfig.put("maxOutputTokens", maxOutputTokens);
                 root.put("generationConfig", generationConfig);
 
@@ -570,84 +581,78 @@ public class BackgroundTaskService extends Service {
                         .post(body)
                         .build();
 
-                safeLog(Log.INFO, " Calling Gemini API (Attempt " + (retryCount + 1) + ")...");
+                safeLog(Log.INFO, "🚀 Calling Gemini API (Fast Mode)...");
 
                 Response response = httpClient.newCall(request).execute();
                 String respStr = response.body() != null ? response.body().string() : "";
-
-                safeLog(Log.INFO, " Gemini Response Code: " + response.code());
 
                 if (response.isSuccessful()) {
                     String reply = extractTextFromGeminiResponse(respStr);
                     String finishReason = extractFinishReason(respStr);
 
-                    if ((reply == null || reply.trim().isEmpty()) && "MAX_TOKENS".equalsIgnoreCase(finishReason) && retryCount < 2) {
-                        safeLog(Log.WARN, "⚠️ Gemini returned MAX_TOKENS - retrying with larger maxOutputTokens...");
-                        callGeminiWithRetry(prompt, isHindi, Math.max(maxOutputTokens * 4, 4096), retryCount + 1);
+                    if ((reply == null || reply.trim().isEmpty()) && "MAX_TOKENS".equalsIgnoreCase(finishReason) && retryCount < 1) {
+                        safeLog(Log.WARN, "⚠️ Retrying with more tokens...");
+                        callGeminiWithRetry(prompt, isHindi, 768, retryCount + 1);
                         return;
                     }
 
                     if (reply != null && !reply.trim().isEmpty()) {
-                        conversationHistory += "Jarvis: " + reply.trim() + "\n";
-                        safeLog(Log.INFO, " Gemini Success: " + reply.trim());
-                        queueResponse(reply.trim(), isHindi);
-                        return;
-                    } else {
-                        safeLog(Log.ERROR, " No text content found in response");
-                        // If no text content, try one more time with same parameters
-                        if (retryCount < 1) {
-                            safeLog(Log.WARN, " Retrying due to empty response...");
-                            handler.postDelayed(() -> callGeminiWithRetry(prompt, isHindi, maxOutputTokens, retryCount + 1), 1000);
-                            return;
-                        }
-                    }
-                } else {
-                    // Handle specific error codes with retry logic
-                    if (response.code() == 503 || response.code() == 429) {
-                        if (retryCount < 3) {
-                            int delay = (retryCount + 1) * 2000;
-                            safeLog(Log.WARN, "⚠️ Gemini overloaded (" + response.code() + ") - retrying in " + delay + "ms...");
-                            handler.postDelayed(() -> callGeminiWithRetry(prompt, isHindi, maxOutputTokens, retryCount + 1), delay);
-                            return;
-                        }
-                    }
-                    safeLog(Log.ERROR, " Gemini API error: " + response.code() + " - " + respStr);
-
-                    // If all retries failed for API error, try one final time
-                    if (retryCount < 1) {
-                        safeLog(Log.WARN, " Final retry after API error...");
-                        handler.postDelayed(() -> callGeminiWithRetry(prompt, isHindi, maxOutputTokens, retryCount + 1), 3000);
+                        // Trim response to be shorter
+                        String trimmedReply = trimResponse(reply.trim());
+                        conversationHistory += "Jarvis: " + trimmedReply + "\n";
+                        safeLog(Log.INFO, "✅ Gemini Success: " + trimmedReply);
+                        queueResponse(trimmedReply, isHindi);
                         return;
                     }
                 }
 
-                // If all retries completely failed, we'll just wait for next user input
-                safeLog(Log.ERROR, " All Gemini attempts failed. Waiting for user input...");
-                handler.post(() -> {
-                    if (jarvisActive && conversationRound < MAX_CONVERSATION_ROUNDS) {
-                        waitingForUser = true;
-                        handler.postDelayed(BackgroundTaskService.this::startListeningToUser, 1000);
-                    }
-                });
+                // Faster fallback - use pre-defined responses if API fails
+                if (retryCount < 1) {
+                    safeLog(Log.WARN, "🔄 Quick retry...");
+                    handler.postDelayed(() -> callGeminiWithRetry(prompt, isHindi, maxOutputTokens, retryCount + 1), 1000);
+                } else {
+                    // Use fallback response
+                    String fallbackResponse = getFallbackResponse(isHindi, conversationRound);
+                    safeLog(Log.INFO, "🔄 Using fallback response");
+                    queueResponse(fallbackResponse, isHindi);
+                }
 
             } catch (Exception e) {
                 safeLog(Log.ERROR, " Gemini error: " + e.getMessage());
-                if (retryCount < 2) {
-                    int delay = (retryCount + 1) * 2000;
-                    safeLog(Log.WARN, "🔄 Retrying after exception in " + delay + "ms...");
-                    handler.postDelayed(() -> callGeminiWithRetry(prompt, isHindi, maxOutputTokens, retryCount + 1), delay);
+                if (retryCount < 1) {
+                    handler.postDelayed(() -> callGeminiWithRetry(prompt, isHindi, maxOutputTokens, retryCount + 1), 1500);
                 } else {
-                    // If all retries failed due to exception, just continue conversation
-                    safeLog(Log.ERROR, " All retries failed due to exceptions. Continuing conversation...");
-                    handler.post(() -> {
-                        if (jarvisActive && conversationRound < MAX_CONVERSATION_ROUNDS) {
-                            waitingForUser = true;
-                            handler.postDelayed(BackgroundTaskService.this::startListeningToUser, 1000);
-                        }
-                    });
+                    // Use fallback response
+                    String fallbackResponse = getFallbackResponse(isHindi, conversationRound);
+                    queueResponse(fallbackResponse, isHindi);
                 }
             }
         });
+    }
+
+    private String trimResponse(String response) {
+        // Ensure response is short (2 sentences max)
+        String[] sentences = response.split("[.!?]+");
+        if (sentences.length > 2) {
+            return sentences[0].trim() + ". " + sentences[1].trim() + ".";
+        }
+        return response;
+    }
+
+    private String getFallbackResponse(boolean isHindi, int round) {
+        if (isHindi) {
+            switch (round) {
+                case 0: return "Kya sab theek hai? Main yahan hoon sunne ke liye.";
+                case 1: return "Sach batao, kya chal raha hai?";
+                default: return "Main samajh sakta hoon. Aap bas baat karte raho.";
+            }
+        } else {
+            switch (round) {
+                case 0: return "Hey, everything okay? I'm here to listen.";
+                case 1: return "What's going on? You can tell me.";
+                default: return "I understand. Just keep talking.";
+            }
+        }
     }
 
     private String extractFinishReason(String respStr) {
@@ -712,10 +717,9 @@ public class BackgroundTaskService extends Service {
         String text = responseQueue.poll();
         if (text == null) {
             isSpeaking = false;
-            // Start listening after all responses are played
             if (jarvisActive && conversationRound < MAX_CONVERSATION_ROUNDS) {
                 waitingForUser = true;
-                handler.postDelayed(this::startListeningToUser, 500);
+                handler.postDelayed(this::startListeningToUser, 300); // Reduced delay
             }
             return;
         }
@@ -727,7 +731,6 @@ public class BackgroundTaskService extends Service {
                 boolean isHindi = parts[0].equals("hi");
                 String actualText = parts[1];
 
-                // Try Murf TTS first, fallback to Android TTS if it fails
                 useMurfTTSWithFallback(actualText, isHindi);
 
             } catch (Exception e) {
@@ -739,16 +742,12 @@ public class BackgroundTaskService extends Service {
     }
 
     private void useMurfTTSWithFallback(String text, boolean isHindi) {
-        // First try Murf TTS
         useMurfTTS(text, isHindi, new TTSFallbackCallback() {
             @Override
-            public void onMurfSuccess() {
-                // Murf succeeded, nothing to do
-            }
+            public void onMurfSuccess() {}
 
             @Override
             public void onMurfFailed() {
-                // Murf failed, fallback to Android TTS
                 safeLog(Log.WARN, "🔄 Murf TTS failed, falling back to Android TTS");
                 useAndroidTTS(text, isHindi);
             }
@@ -757,23 +756,13 @@ public class BackgroundTaskService extends Service {
 
     private void useMurfTTS(String text, boolean isHindi, TTSFallbackCallback callback) {
         try {
-            // Use DIFFERENT voices for Hindi and English
-            String voiceId;
-            if (isHindi) {
-                // Use Kabir voice for Hindi
-                voiceId = "hi-IN-kabir";
-                safeLog(Log.INFO, "🔊 Using Kabir voice for Hindi response");
-            } else {
-                // Use Aarav voice for English
-                voiceId = "en-IN-aarav";
-                safeLog(Log.INFO, "🔊 Using Aarav voice for English response");
-            }
+            String voiceId = isHindi ? "hi-IN-kabir" : "en-IN-aarav";
 
             JSONObject json = new JSONObject();
             json.put("text", text);
             json.put("voice_id", voiceId);
             json.put("style", "Conversational");
-            json.put("speed", 1.0);
+            json.put("speed", 1.1); // Slightly faster speed
             json.put("pitch", 1.0);
             json.put("sample_rate", 24000);
 
@@ -786,7 +775,7 @@ public class BackgroundTaskService extends Service {
                     .post(body)
                     .build();
 
-            safeLog(Log.INFO, "🔊 Calling Murf TTS with " + (isHindi ? "Kabir" : "Aarav") + " voice for " + (isHindi ? "Hindi" : "English") + "...");
+            safeLog(Log.INFO, "🔊 Calling Murf TTS...");
 
             Response response = httpClient.newCall(request).execute();
             String respStr = response.body() != null ? response.body().string() : "";
@@ -812,12 +801,6 @@ public class BackgroundTaskService extends Service {
                         return;
                     }
                 }
-            } else {
-                safeLog(Log.ERROR, "❌ Murf TTS failed: " + respStr);
-                // Check if it's a character limit error
-                if (respStr.contains("402") || respStr.contains("characters have been consumed")) {
-                    safeLog(Log.ERROR, "❌ Murf TTS character limit reached");
-                }
             }
         } catch (Exception e) {
             safeLog(Log.ERROR, "❌ Murf TTS error: " + e.getMessage());
@@ -840,7 +823,6 @@ public class BackgroundTaskService extends Service {
 
         handler.post(() -> {
             try {
-                // Set appropriate language
                 Locale locale = isHindi ? new Locale("hi", "IN") : Locale.US;
                 int result = textToSpeech.setLanguage(locale);
 
@@ -851,7 +833,6 @@ public class BackgroundTaskService extends Service {
                     return;
                 }
 
-                // Speak using TTS
                 HashMap<String, String> params = new HashMap<>();
                 params.put(TextToSpeech.Engine.KEY_PARAM_UTTERANCE_ID, "jarvis-tts");
 
@@ -884,18 +865,16 @@ public class BackgroundTaskService extends Service {
                 mediaPlayer = null;
                 isSpeaking = false;
 
-                // Check if user interrupted during this response
                 if (userInterrupted) {
                     safeLog(Log.INFO, "🔄 User interrupted - processing their speech now");
                     userInterrupted = false;
                 } else {
-                    // Continue normal flow
                     handler.post(() -> {
                         if (!responseQueue.isEmpty()) {
                             playNextResponse();
                         } else if (jarvisActive && conversationRound < MAX_CONVERSATION_ROUNDS) {
                             waitingForUser = true;
-                            handler.postDelayed(BackgroundTaskService.this::startListeningToUser, 500);
+                            handler.postDelayed(BackgroundTaskService.this::startListeningToUser, 300);
                         }
                     });
                 }
@@ -921,17 +900,14 @@ public class BackgroundTaskService extends Service {
 
         safeLog(Log.INFO,"🎤 User said: " + userText);
 
-        // DYNAMICALLY detect language from what user just spoke - this updates for EVERY input
         String detectedLanguage = detectLanguageFromSpeech(userText);
-        currentConversationLanguage = detectedLanguage; // Update current language
+        currentConversationLanguage = detectedLanguage;
         boolean isHindi = detectedLanguage.equals("hi");
 
         safeLog(Log.INFO, "🌐 Language dynamically set to: " + (isHindi ? "Hindi" : "English"));
 
-        // Update conversation history with user's response
         conversationHistory += "User: " + userText + "\n";
 
-        // If user interrupted mid-speech, we still count it as a conversation round
         if (userInterrupted) {
             conversationRound++;
             userInterrupted = false;
@@ -939,7 +915,7 @@ public class BackgroundTaskService extends Service {
 
         safeLog(Log.INFO, "🤖 Conversation Round: " + conversationRound + "/" + MAX_CONVERSATION_ROUNDS);
 
-        // Check if user wants to exit
+        // Check exit commands
         if (userText.toLowerCase().contains("exit") || userText.toLowerCase().contains("close") ||
                 userText.toLowerCase().contains("stop") || userText.toLowerCase().contains("bye") ||
                 userText.toLowerCase().contains("band") || userText.toLowerCase().contains("ruk") ||
@@ -947,47 +923,25 @@ public class BackgroundTaskService extends Service {
 
             safeLog(Log.INFO, "🚪 User requested to exit - closing Instagram");
 
-            // Provide farewell message first
             String farewellMessage = isHindi ?
-                    "Theek hai dost! Main Instagram band kar raha hoon. Aap kabhi bhi baat kar sakte hain. Take care!" :
-                    "Okay friend! I'm closing Instagram. You can always talk to me anytime. Take care!";
+                    "Theek hai! Instagram band karta hoon. Take care!" :
+                    "Okay! Closing Instagram. Take care!";
 
             queueResponse(farewellMessage, isHindi);
 
-            // Then close Instagram after a delay to let the message play
             handler.postDelayed(() -> {
                 closeInstagram();
                 endConversation();
-            }, 3000);
+            }, 2000); // Reduced delay
             return;
         }
 
-        // Check if we should ask about continuing (after 6th round)
-        if (conversationRound >= 6 && conversationRound < MAX_CONVERSATION_ROUNDS) {
-            // Ask if user wants to continue
-            String continuePrompt = isHindi ?
-                    "Kya aap baat karna jaari rakhna chahenge? Agar nahi to 'exit' bol sakte hain." :
-                    "Would you like to continue talking? If not, you can say 'exit'.";
-
-            queueResponse(continuePrompt, isHindi);
-
-            // Increment round and wait for user response
-            conversationRound++;
-            waitingForUser = true;
-            handler.postDelayed(this::startListeningToUser, 500);
-            return;
-        }
-
-        // Increment conversation round
-        conversationRound++;
-
-        // Normal conversation flow
+        // Continue conversation with faster prompt
         if (jarvisActive && conversationRound < MAX_CONVERSATION_ROUNDS) {
-            // Continue conversation based on what user said in CURRENT language
-            String prompt = buildJarvisPrompt(userText, "neutral", isHindi, conversationHistory);
-            callGeminiWithRetry(prompt, isHindi, 1024, 0);
+            double percentage = calculateNegativePercentage();
+            String prompt = buildQuickJarvisPrompt(userText, isHindi, percentage);
+            callGeminiWithRetry(prompt, isHindi, 512, 0);
         } else {
-            // End of conversation - provide gentle closure
             endConversationWithMessage(isHindi);
         }
     }
@@ -996,12 +950,10 @@ public class BackgroundTaskService extends Service {
         try {
             safeLog(Log.INFO, "🚪 Starting Instagram close process...");
 
-            // Strategy 1: Primary method - Broadcast to MainActivity
             Intent exitIntent = new Intent("CLOSE_INSTAGRAM");
             LocalBroadcastManager.getInstance(this).sendBroadcast(exitIntent);
             safeLog(Log.INFO, "📡 Sent CLOSE_INSTAGRAM broadcast to MainActivity");
 
-            // Strategy 2: Fallback - Send a delayed broadcast in case first one fails
             handler.postDelayed(() -> {
                 try {
                     Intent fallbackIntent = new Intent("CLOSE_INSTAGRAM_FALLBACK");
@@ -1010,9 +962,8 @@ public class BackgroundTaskService extends Service {
                 } catch (Exception e) {
                     safeLog(Log.ERROR, "❌ Fallback broadcast failed: " + e.getMessage());
                 }
-            }, 1000);
+            }, 800); // Reduced delay
 
-            // Strategy 3: Emergency fallback - Stop our own services if everything else fails
             handler.postDelayed(() -> {
                 try {
                     if (jarvisActive) {
@@ -1025,9 +976,9 @@ public class BackgroundTaskService extends Service {
                 } catch (Exception e) {
                     safeLog(Log.ERROR, "❌ Emergency stop failed: " + e.getMessage());
                 }
-            }, 3000);
+            }, 2000); // Reduced delay
 
-            safeLog(Log.INFO, "✅ Instagram close process initiated with multiple strategies");
+            safeLog(Log.INFO, "✅ Instagram close process initiated");
 
         } catch (Exception e) {
             safeLog(Log.ERROR, "❌ Error in closeInstagram: " + e.getMessage());
@@ -1042,10 +993,9 @@ public class BackgroundTaskService extends Service {
         conversationHistory = "";
         waitingForUser = false;
 
-        // Return to normal detection
         handler.postDelayed(() -> {
             safeLog(Log.INFO, "🔄 Returning to normal content detection");
-        }, 3000);
+        }, 1500); // Reduced delay
     }
 
     private void endConversationWithMessage(boolean isHindi) {
@@ -1053,20 +1003,19 @@ public class BackgroundTaskService extends Service {
         stopDetection = false;
         negativeCount = 0;
 
-        String closingPrompt = isHindi ?
-                "The conversation is ending. Provide gentle closure in Hindi. Summarize positively and remind them you're there for them. Keep it friendly and encouraging in Roman Hindi." :
-                "The conversation is ending. Provide gentle closure. Summarize positively and remind them you're there for them. Keep it friendly and encouraging.";
+        String closingMessage = isHindi ?
+                "Main yahan hoon agar baat karni ho. Khayal rakhna!" :
+                "I'm here if you need to talk. Take care!";
 
-        callGeminiWithRetry(closingPrompt, isHindi, 1024, 0);
+        queueResponse(closingMessage, isHindi);
 
-        // Return to normal detection after a delay
         handler.postDelayed(() -> {
             jarvisActive = false;
             stopDetection = false;
             conversationRound = 0;
             conversationHistory = "";
             safeLog(Log.INFO, "🔄 Returning to normal content detection");
-        }, 5000);
+        }, 3000); // Reduced delay
     }
 
     private void safeLog(int level, String msg) {

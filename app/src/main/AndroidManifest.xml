@@ -2,7 +2,8 @@
     xmlns:tools="http://schemas.android.com/tools">
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.KILL_BACKGROUND_PROCESSES" />
-    <uses-permission android:name="android.permission.BROADCAST_CLOSE_SYSTEM_DIALOGS" />
+    <uses-permission android:name="android.permission.USE_FULL_SCREEN_INTENT" />
+    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
     <uses-permission android:name="android.permission.WRITE_SECURE_SETTINGS"
@@ -84,5 +85,10 @@
         <activity
             android:name=".MainActivity"
             android:exported="false"/>
+        <activity android:name=".NotificationHistoryActivity"
+            android:label="Notification History"
+            android:theme="@style/Theme.AppCompat.Light.DarkActionBar" />
+
+        <receiver android:name=".NotificationDismissReceiver" />
     </application>
 </manifest>

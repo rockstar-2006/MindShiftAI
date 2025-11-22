@@ -9,12 +9,20 @@ import android.content.BroadcastReceiver;
 import android.content.Context;
 import android.content.Intent;
 import android.content.IntentFilter;
+import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
+import android.graphics.Canvas;
+import android.graphics.Color;
+import android.graphics.Paint;
+import android.graphics.Path;
 import android.media.projection.MediaProjectionManager;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
+import android.util.Log;
+import android.view.View;
 import android.widget.Button;
+import android.widget.LinearLayout;
 import android.widget.ProgressBar;
 import android.widget.TextView;
 import android.widget.Toast;
@@ -26,12 +34,25 @@ import androidx.core.app.NotificationCompat;
 import androidx.core.content.ContextCompat;
 import androidx.localbroadcastmanager.content.LocalBroadcastManager;
 
+import org.json.JSONArray;
+import org.json.JSONException;
+import org.json.JSONObject;
+
+import java.text.SimpleDateFormat;
+import java.util.ArrayList;
+import java.util.Calendar;
+import java.util.Date;
+import java.util.List;
+import java.util.Locale;
+import java.util.Random;
+
 public class MainActivity extends AppCompatActivity {
 
     private Button startBtn, stopBtn;
     private TextView positiveCountView, negativeCountView, negativePercentageView;
-    private TextView positiveTrendView, negativeTrendView;
+    private TextView positiveTrendView, negativeTrendView, riskLevelText, lateNightSessions, weeklyInsights;
     private ProgressBar negativeProgressBar;
+    private LinearLayout graphContainer;
     private static final int REQUEST_SCREEN_CAPTURE = 1001;
     private static final int REQUEST_PERMISSIONS = 2001;
     private BroadcastReceiver closeInstagramFallbackReceiver;
@@ -43,18 +64,42 @@ public class MainActivity extends AppCompatActivity {
     // Track counts
     private int positiveCount = 0;
     private int negativeCount = 0;
+    private int lateNightCount = 0;
 
     // Track previous counts for trend calculation
     private int previousPositiveCount = 0;
     private int previousNegativeCount = 0;
+
+    // Depression risk tracking
+    private SharedPreferences sharedPreferences;
+    private static final String PREFS_NAME = "MindShiftPrefs";
+    private static final String DAILY_DATA_KEY = "daily_mental_data";
+    private static final String LATE_NIGHT_KEY = "late_night_sessions";
+
+    // Graph data
+    private List<MentalHealthData> weeklyData = new ArrayList<>();
+    private Paint graphPaint, riskPaint, gridPaint, textPaint;
+    private int[] riskColors = {Color.GREEN, Color.YELLOW, Color.rgb(255, 165, 0), Color.RED};
+
+    // Handler for late-night monitoring
+    private Handler lateNightHandler = new Handler();
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         setContentView(R.layout.activity_main);
 
+        // Initialize SharedPreferences
+        sharedPreferences = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
+
         // Initialize all UI components
         initializeViews();
+
+        // Initialize graph paints
+        initializeGraphPaints();
+
+        // Load historical data
+        loadHistoricalData();
 
         // Initialize UI with default values
         updateUI();
@@ -70,6 +115,9 @@ public class MainActivity extends AppCompatActivity {
 
         // Register all broadcast receivers
         registerBroadcastReceivers();
+
+        // Start late night monitoring
+        startLateNightMonitoring();
     }
 
     /**
@@ -82,9 +130,422 @@ public class MainActivity extends AppCompatActivity {
         negativeCountView = findViewById(R.id.negativeCount);
         negativePercentageView = findViewById(R.id.negativePercentage);
         negativeProgressBar = findViewById(R.id.negativeProgress);
+        positiveTrendView = findViewById(R.id.positiveTrend);
+        negativeTrendView = findViewById(R.id.negativeTrend);
+        riskLevelText = findViewById(R.id.riskLevelText);
+        lateNightSessions = findViewById(R.id.lateNightSessions);
+        weeklyInsights = findViewById(R.id.weeklyInsights);
+        graphContainer = findViewById(R.id.graphContainer);
+    }
 
-        // Initialize trend views
+    /**
+     * Initialize graph painting tools
+     */
+    private void initializeGraphPaints() {
+        // Graph line paint
+        graphPaint = new Paint();
+        graphPaint.setColor(Color.parseColor("#1A73E8"));
+        graphPaint.setStrokeWidth(6f);
+        graphPaint.setStyle(Paint.Style.STROKE);
+        graphPaint.setAntiAlias(true);
+        graphPaint.setStrokeCap(Paint.Cap.ROUND);
 
+        // Risk area paint
+        riskPaint = new Paint();
+        riskPaint.setStyle(Paint.Style.FILL);
+        riskPaint.setAntiAlias(true);
+
+        // Grid paint
+        gridPaint = new Paint();
+        gridPaint.setColor(Color.parseColor("#E0E0E0"));
+        gridPaint.setStrokeWidth(1f);
+        gridPaint.setStyle(Paint.Style.STROKE);
+
+        // Text paint
+        textPaint = new Paint();
+        textPaint.setColor(Color.parseColor("#666666"));
+        textPaint.setTextSize(36f);
+        textPaint.setAntiAlias(true);
+        textPaint.setTextAlign(Paint.Align.CENTER);
+    }
+
+    /**
+     * Load historical mental health data
+     */
+    private void loadHistoricalData() {
+        String dailyDataJson = sharedPreferences.getString(DAILY_DATA_KEY, "[]");
+        lateNightCount = sharedPreferences.getInt(LATE_NIGHT_KEY, 0);
+
+        try {
+            JSONArray jsonArray = new JSONArray(dailyDataJson);
+            weeklyData.clear();
+
+            // Generate sample data for the last 7 days if none exists
+            if (jsonArray.length() == 0) {
+                generateSampleData();
+            } else {
+                for (int i = 0; i < jsonArray.length(); i++) {
+                    JSONObject jsonObject = jsonArray.getJSONObject(i);
+                    MentalHealthData data = new MentalHealthData(
+                            jsonObject.getString("date"),
+                            jsonObject.getInt("negativeContent"),
+                            jsonObject.getInt("positiveContent"),
+                            jsonObject.getInt("screenTime"),
+                            jsonObject.getBoolean("lateNight")
+                    );
+                    weeklyData.add(data);
+                }
+            }
+        } catch (JSONException e) {
+            Log.e("MainActivity", "Error loading historical data", e);
+            generateSampleData();
+        }
+    }
+
+    /**
+     * Generate sample data for demonstration
+     */
+    private void generateSampleData() {
+        weeklyData.clear();
+        Calendar calendar = Calendar.getInstance();
+        Random random = new Random();
+
+        for (int i = 6; i >= 0; i--) {
+            calendar.add(Calendar.DAY_OF_YEAR, -1);
+            Date date = calendar.getTime();
+            SimpleDateFormat sdf = new SimpleDateFormat("yyyy-MM-dd", Locale.getDefault());
+
+            int negative = random.nextInt(20);
+            int positive = random.nextInt(30) + 10;
+            int screenTime = random.nextInt(120) + 60;
+            boolean lateNight = random.nextBoolean();
+
+            weeklyData.add(new MentalHealthData(
+                    sdf.format(date),
+                    negative,
+                    positive,
+                    screenTime,
+                    lateNight
+            ));
+        }
+
+        saveHistoricalData();
+    }
+
+    /**
+     * Save current data to SharedPreferences
+     */
+    private void saveHistoricalData() {
+        try {
+            JSONArray jsonArray = new JSONArray();
+            for (MentalHealthData data : weeklyData) {
+                JSONObject jsonObject = new JSONObject();
+                jsonObject.put("date", data.getDate());
+                jsonObject.put("negativeContent", data.getNegativeContent());
+                jsonObject.put("positiveContent", data.getPositiveContent());
+                jsonObject.put("screenTime", data.getScreenTime());
+                jsonObject.put("lateNight", data.isLateNight());
+                jsonArray.put(jsonObject);
+            }
+
+            SharedPreferences.Editor editor = sharedPreferences.edit();
+            editor.putString(DAILY_DATA_KEY, jsonArray.toString());
+            editor.putInt(LATE_NIGHT_KEY, lateNightCount);
+            editor.apply();
+        } catch (JSONException e) {
+            Log.e("MainActivity", "Error saving historical data", e);
+        }
+    }
+
+    /**
+     * Start monitoring for late-night usage
+     */
+    private void startLateNightMonitoring() {
+        Runnable lateNightChecker = new Runnable() {
+            @Override
+            public void run() {
+                checkLateNightUsage();
+                lateNightHandler.postDelayed(this, 60000); // Check every minute
+            }
+        };
+        lateNightHandler.postDelayed(lateNightChecker, 1000);
+    }
+
+    /**
+     * Check if current time is late night and user is active
+     */
+    private void checkLateNightUsage() {
+        Calendar calendar = Calendar.getInstance();
+        int hour = calendar.get(Calendar.HOUR_OF_DAY);
+
+        // Late night hours: 10 PM to 4 AM
+        boolean isLateNight = (hour >= 22 || hour <= 4);
+
+        if (isLateNight && isServiceRunning()) {
+            // Increment late night counter
+            lateNightCount++;
+            saveHistoricalData();
+
+            // Show late night warning every 30 minutes
+            if (lateNightCount % 30 == 0) {
+                showLateNightWarning();
+            }
+
+            updateUI();
+        }
+    }
+
+    /**
+     * Check if monitoring service is running
+     */
+    private boolean isServiceRunning() {
+        return positiveCount > 0 || negativeCount > 0;
+    }
+
+    /**
+     * Show late night usage warning
+     */
+    private void showLateNightWarning() {
+        try {
+            NotificationManager manager = (NotificationManager) getSystemService(NOTIFICATION_SERVICE);
+            if (manager == null) return;
+
+            NotificationCompat.Builder builder = new NotificationCompat.Builder(this, "break_reminders")
+                    .setSmallIcon(android.R.drawable.ic_dialog_info)
+                    .setContentTitle("🌙 Late Night Usage Alert")
+                    .setContentText("Consider taking a break for better sleep")
+                    .setStyle(new NotificationCompat.BigTextStyle()
+                            .bigText("📱 **Late Night Digital Usage Detected**\n\n" +
+                                    "Using your phone late at night can:\n\n" +
+                                    "• 🌙 Disrupt your sleep cycle\n" +
+                                    "• 🧠 Affect mental clarity tomorrow\n" +
+                                    "• 😴 Reduce sleep quality\n" +
+                                    "• 📉 Impact overall mental health\n\n" +
+                                    "💡 **Recommendation:**\n" +
+                                    "Try to put your phone away at least 1 hour before bedtime for better mental wellness!"))
+                    .setPriority(NotificationCompat.PRIORITY_HIGH)
+                    .setAutoCancel(true)
+                    .setTimeoutAfter(30000)
+                    .setColor(Color.parseColor("#6A5ACD"));
+
+            manager.notify(1006, builder.build());
+            safeLog("✅ Late night warning notification sent");
+        } catch (Exception e) {
+            safeLog("❌ Late night notification failed: " + e.getMessage());
+        }
+    }
+
+    /**
+     * Update today's data with current counts
+     */
+    private void updateTodaysData() {
+        Calendar calendar = Calendar.getInstance();
+        SimpleDateFormat sdf = new SimpleDateFormat("yyyy-MM-dd", Locale.getDefault());
+        String today = sdf.format(calendar.getTime());
+
+        // Find today's data or create new
+        MentalHealthData todayData = null;
+        for (MentalHealthData data : weeklyData) {
+            if (data.getDate().equals(today)) {
+                todayData = data;
+                break;
+            }
+        }
+
+        if (todayData == null) {
+            // Remove oldest data if we have 7 days
+            if (weeklyData.size() >= 7) {
+                weeklyData.remove(0);
+            }
+
+            // Create new data for today
+            int hour = calendar.get(Calendar.HOUR_OF_DAY);
+            boolean isLateNight = (hour >= 22 || hour <= 4);
+
+            todayData = new MentalHealthData(today, negativeCount, positiveCount, 0, isLateNight);
+            weeklyData.add(todayData);
+        } else {
+            // Update existing data
+            todayData.setNegativeContent(negativeCount);
+            todayData.setPositiveContent(positiveCount);
+        }
+
+        saveHistoricalData();
+        drawMentalHealthGraph();
+    }
+
+    /**
+     * Draw mental health graph
+     */
+    private void drawMentalHealthGraph() {
+        graphContainer.removeAllViews();
+
+        // Create custom view for graph
+        View graphView = new View(this) {
+            @Override
+            protected void onDraw(Canvas canvas) {
+                super.onDraw(canvas);
+                drawGraph(canvas);
+            }
+        };
+
+        graphView.setLayoutParams(new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.MATCH_PARENT
+        ));
+
+        graphContainer.addView(graphView);
+    }
+
+    /**
+     * Draw the actual graph on canvas
+     */
+    private void drawGraph(Canvas canvas) {
+        int width = canvas.getWidth();
+        int height = canvas.getHeight();
+        int padding = 50;
+
+        // Draw grid lines
+        for (int i = 1; i <= 4; i++) {
+            float y = height - padding - (i * (height - 2 * padding) / 4);
+            canvas.drawLine(padding, y, width - padding, y, gridPaint);
+        }
+
+        if (weeklyData.isEmpty()) return;
+
+        // Calculate depression risk scores and plot points
+        List<Float> riskScores = new ArrayList<>();
+        for (MentalHealthData data : weeklyData) {
+            riskScores.add(calculateDepressionRisk(data));
+        }
+
+        // Draw risk areas
+        drawRiskAreas(canvas, width, height, padding);
+
+        // Draw graph line
+        Path path = new Path();
+        float xStep = (float) (width - 2 * padding) / (riskScores.size() - 1);
+
+        for (int i = 0; i < riskScores.size(); i++) {
+            float x = padding + (i * xStep);
+            float y = height - padding - (riskScores.get(i) * (height - 2 * padding) / 100);
+
+            if (i == 0) {
+                path.moveTo(x, y);
+            } else {
+                path.lineTo(x, y);
+            }
+
+            // Draw data points
+            canvas.drawCircle(x, y, 8, graphPaint);
+        }
+
+        canvas.drawPath(path, graphPaint);
+
+        // Update risk level text
+        updateRiskLevel(riskScores.get(riskScores.size() - 1));
+    }
+
+    /**
+     * Draw colored risk areas behind the graph
+     */
+    private void drawRiskAreas(Canvas canvas, int width, int height, int padding) {
+        int[] riskLevels = {25, 50, 75, 100};
+
+        for (int i = 0; i < riskLevels.length; i++) {
+            float top = height - padding - (riskLevels[i] * (height - 2 * padding) / 100);
+            float bottom = (i == 0) ? height - padding :
+                    height - padding - (riskLevels[i-1] * (height - 2 * padding) / 100);
+
+            riskPaint.setColor(riskColors[i]);
+            riskPaint.setAlpha(30); // Semi-transparent
+
+            canvas.drawRect(padding, top, width - padding, bottom, riskPaint);
+        }
+    }
+
+    /**
+     * Calculate depression risk score (0-100)
+     */
+    private float calculateDepressionRisk(MentalHealthData data) {
+        float risk = 0f;
+
+        // Negative content impact (40% weight)
+        risk += (data.getNegativeContent() / 50f) * 40;
+
+        // Positive content balance (20% weight)
+        float positivityRatio = (data.getPositiveContent() == 0) ? 1 :
+                (float) data.getNegativeContent() / data.getPositiveContent();
+        risk += Math.min(positivityRatio * 20, 20);
+
+        // Late night usage impact (20% weight)
+        if (data.isLateNight()) {
+            risk += 20;
+        }
+
+        // Screen time impact (20% weight)
+        risk += Math.min(data.getScreenTime() / 300f * 20, 20);
+
+        return Math.min(risk, 100);
+    }
+
+    /**
+     * Update risk level text based on current score
+     */
+    private void updateRiskLevel(float currentRisk) {
+        String riskLevel;
+        int color;
+
+        if (currentRisk <= 25) {
+            riskLevel = "Low Risk";
+            color = Color.parseColor("#4CAF50");
+        } else if (currentRisk <= 50) {
+            riskLevel = "Moderate Risk";
+            color = Color.parseColor("#FFC107");
+        } else if (currentRisk <= 75) {
+            riskLevel = "High Risk";
+            color = Color.parseColor("#FF9800");
+        } else {
+            riskLevel = "Very High Risk";
+            color = Color.parseColor("#F44336");
+        }
+
+        riskLevelText.setText(riskLevel);
+        riskLevelText.setTextColor(color);
+
+        // Update insights
+        updateWeeklyInsights();
+    }
+
+    /**
+     * Generate weekly insights
+     */
+    private void updateWeeklyInsights() {
+        if (weeklyData.size() < 2) return;
+
+        MentalHealthData currentWeek = weeklyData.get(weeklyData.size() - 1);
+        MentalHealthData previousWeek = weeklyData.get(weeklyData.size() - 2);
+
+        int negativeChange = currentWeek.getNegativeContent() - previousWeek.getNegativeContent();
+        int positiveChange = currentWeek.getPositiveContent() - previousWeek.getPositiveContent();
+
+        StringBuilder insights = new StringBuilder();
+
+        if (negativeChange < 0) {
+            insights.append("• You watched ").append(Math.abs(negativeChange)).append("% less negative content this week\n");
+        } else {
+            insights.append("• Negative content increased by ").append(negativeChange).append("%\n");
+        }
+
+        if (positiveChange > 0) {
+            insights.append("• Positive engagement up by ").append(positiveChange).append("%\n");
+        }
+
+        insights.append("• ").append(lateNightCount).append(" late-night sessions detected\n");
+        insights.append("• Mental wellness trend: ").append(riskLevelText.getText());
+
+        weeklyInsights.setText(insights.toString());
+        lateNightSessions.setText("🌙 " + lateNightCount + " Late Nights");
     }
 
     /**
@@ -116,7 +577,7 @@ public class MainActivity extends AppCompatActivity {
                     // Update UI
                     updateUI();
 
-                    safeLog(" Counts updated - Positive: " + positive + ", Negative: " + negative);
+                    safeLog("📊 Counts updated - Positive: " + positive + ", Negative: " + negative);
                 }
             }
         };
@@ -173,7 +634,7 @@ public class MainActivity extends AppCompatActivity {
             @Override
             public void onReceive(Context context, Intent intent) {
                 if ("CLOSE_INSTAGRAM_FALLBACK".equals(intent.getAction())) {
-                    safeLog(" Received fallback close Instagram broadcast");
+                    safeLog("🔄 Received fallback close Instagram broadcast");
                     showEnhancedBreakNotification();
                 }
             }
@@ -201,7 +662,10 @@ public class MainActivity extends AppCompatActivity {
             // Update trend percentages
             updateTrendPercentages();
 
-            safeLog(" UI Updated - Positive: " + positiveCount +
+            // Update today's data and graph
+            updateTodaysData();
+
+            safeLog("🔄 UI Updated - Positive: " + positiveCount +
                     ", Negative: " + negativeCount +
                     ", Percentage: " + negativePercentage + "%");
         });
@@ -229,7 +693,7 @@ public class MainActivity extends AppCompatActivity {
         previousPositiveCount = positiveCount;
         previousNegativeCount = negativeCount;
 
-        safeLog(" Trends - Positive: " + positiveTrendText + ", Negative: " + negativeTrendText);
+        safeLog("📈 Trends - Positive: " + positiveTrendText + ", Negative: " + negativeTrendText);
     }
 
     /**
@@ -328,7 +792,7 @@ public class MainActivity extends AppCompatActivity {
 
     // ENHANCED NOTIFICATION SYSTEM
     private void showEnhancedBreakNotification() {
-        safeLog(" Enhanced notification system activated");
+        safeLog("🚪 Enhanced notification system activated");
 
         // 1. Stop monitoring services
         stopAllServices();
@@ -342,7 +806,7 @@ public class MainActivity extends AppCompatActivity {
         // 4. Navigate to home screen
         goToHomeScreenGently();
 
-        safeLog(" Complete break system activated");
+        safeLog("✅ Complete break system activated");
     }
 
     private void showPrimaryBreakNotification() {
@@ -351,7 +815,7 @@ public class MainActivity extends AppCompatActivity {
             if (manager == null) return;
 
             // Include current stats in notification
-            String statsMessage = " Your Session Stats:\n" +
+            String statsMessage = "📊 Your Session Stats:\n" +
                     "• Positive Content: " + positiveCount + "\n" +
                     "• Mindful Alerts: " + negativeCount + "\n" +
                     "• Negative Ratio: " + calculateNegativePercentage() + "%\n\n";
@@ -362,9 +826,9 @@ public class MainActivity extends AppCompatActivity {
                     .setContentText("Healthy Instagram break started")
                     .setStyle(new NotificationCompat.BigTextStyle()
                             .bigText(statsMessage +
-                                    " Great job practicing digital wellness! ✨\n\n" +
+                                    "✨ Great job practicing digital wellness! ✨\n\n" +
                                     "Your Jarvis AI assistant has activated a mindful break from Instagram.\n\n" +
-                                    " Benefits you're getting:\n" +
+                                    "🎯 Benefits you're getting:\n" +
                                     "• Reduced digital fatigue\n" +
                                     "• Improved mental clarity\n" +
                                     "• Better focus and productivity\n" +
@@ -489,6 +953,8 @@ public class MainActivity extends AppCompatActivity {
     @Override
     protected void onDestroy() {
         super.onDestroy();
+        // Stop late night monitoring
+        lateNightHandler.removeCallbacksAndMessages(null);
         // Unregister all receivers
         unregisterBroadcastReceivers();
     }
@@ -746,5 +1212,37 @@ public class MainActivity extends AppCompatActivity {
         if (BuildConfig.DEBUG) {
             android.util.Log.d("MainActivity", message);
         }
+    }
+
+    /**
+     * Data class for mental health tracking
+     */
+    private static class MentalHealthData {
+        private String date;
+        private int negativeContent;
+        private int positiveContent;
+        private int screenTime; // in minutes
+        private boolean lateNight;
+
+        public MentalHealthData(String date, int negativeContent, int positiveContent,
+                                int screenTime, boolean lateNight) {
+            this.date = date;
+            this.negativeContent = negativeContent;
+            this.positiveContent = positiveContent;
+            this.screenTime = screenTime;
+            this.lateNight = lateNight;
+        }
+
+        // Getters and setters
+        public String getDate() { return date; }
+        public int getNegativeContent() { return negativeContent; }
+        public int getPositiveContent() { return positiveContent; }
+        public int getScreenTime() { return screenTime; }
+        public boolean isLateNight() { return lateNight; }
+
+        public void setNegativeContent(int negativeContent) { this.negativeContent = negativeContent; }
+        public void setPositiveContent(int positiveContent) { this.positiveContent = positiveContent; }
+        public void setScreenTime(int screenTime) { this.screenTime = screenTime; }
+        public void setLateNight(boolean lateNight) { this.lateNight = lateNight; }
     }
 }
